@@ -28,6 +28,13 @@ use windows::core::{BOOL, PCWSTR, Result, w};
 const HELP: &str = "commands: m X Y (move Area) | r W H (resize) | off | on | s (stats) | q (quit)";
 
 static MAIN_TID: AtomicU32 = AtomicU32::new(0);
+const WM_RECAPTURE: u32 = WM_APP + 1;
+
+fn recapture() {
+    unsafe {
+        let _ = PostThreadMessageW(MAIN_TID.load(Ordering::SeqCst), WM_RECAPTURE, WPARAM(0), LPARAM(0));
+    }
+}
 static CLEANED_UP: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
 fn main() {
@@ -247,7 +254,9 @@ fn mirror_until_quit(real: &Real, area: Area, display: Option<Arc<Mutex<Display>
     let gpu = mirror::create_device()?;
     let hwnd = create_window(rect)?;
     let mirror = Arc::new(Mutex::new(Mirror::new(&gpu, hwnd, area)?));
-    let capture = mirror::start_capture(&gpu, real.monitor, mirror.clone())?;
+    // Adding the Virtual monitor changes the display topology, which invalidates the HMONITOR taken at startup.
+    let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    let mut capture = mirror::start_capture(&gpu, monitor, mirror.clone())?;
     println!("[border] look at the real monitor now: is a yellow capture border drawn around it?");
 
     unsafe {
@@ -283,6 +292,20 @@ fn mirror_until_quit(real: &Real, area: Area, display: Option<Arc<Mutex<Display>
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.hwnd.is_invalid() && msg.message == WM_RECAPTURE {
+                // A monitor add/remove kills the WGC capture of the real screen; start a fresh one.
+                let _ = capture.session.Close();
+                let _ = capture.pool.Close();
+                let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+                match mirror::start_capture(&gpu, monitor, mirror.clone()) {
+                    Ok(c) => {
+                        capture = c;
+                        println!("[wgc] capture restarted");
+                    }
+                    Err(e) => println!("[wgc] capture restart failed: {e}"),
+                }
+                continue;
+            }
             DispatchMessageW(&msg);
         }
     }
@@ -384,6 +407,9 @@ fn command(
             };
             place(hwnd, rect);
             mirror.lock().unwrap().presenting = true;
+            if display.is_some() {
+                recapture();
+            }
             println!("[on] presenting");
         }
         _ => println!("unknown command: {line:?}\n{HELP}"),
@@ -439,6 +465,9 @@ fn resize(w: u32, h: u32, mirror: &Mutex<Mirror>, display: Option<&Mutex<Display
     };
     if was_presenting {
         place(hwnd, rect);
+        if display.is_some() {
+            recapture();
+        }
     }
     mirror.lock().unwrap().presenting = was_presenting;
     println!(
