@@ -1,7 +1,7 @@
 # Glossary
 
 **Area**
-The rectangle of the real screen that viewers see. Freely shaped, defaults to 2560×1440 centered. The stream is the Area pixel for pixel, never scaled or padded.
+The rectangle of the real screen that viewers see. Freely shaped but always an even number of pixels wide and tall, defaults to 2560×1440 centered. The stream is the Area pixel for pixel, never scaled or padded.
 _Avoid_: region, crop, zone
 
 **Border**
