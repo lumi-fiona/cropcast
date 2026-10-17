@@ -19,6 +19,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
@@ -31,6 +32,11 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[features]
+# Embeds the signed Driver package from driver/ (the CI `driver` job's artifact). Without it
+# cropcast still uses an installed SudoVDA, but can't install one.
+driver = []
 
 [profile.release]
 lto = true

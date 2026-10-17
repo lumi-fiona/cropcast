@@ -11,11 +11,18 @@ permissions:
 
 jobs:
   build:
+    needs: driver
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --release --locked
-      - run: cargo build --release --locked
+      # The exe embeds the signed Driver; builds without one (PRs, forks) embed none.
+      - if: needs.driver.outputs.signed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: driver
+          path: driver
+      - run: cargo test --release --locked ${{ needs.driver.outputs.signed == 'true' && '--features driver' || '' }}
+      - run: cargo build --release --locked ${{ needs.driver.outputs.signed == 'true' && '--features driver' || '' }}
       - uses: actions/upload-artifact@v4
         with:
           name: cropcast
@@ -30,6 +37,8 @@ jobs:
     runs-on: windows-2022
     permissions:
       contents: read
+    outputs:
+      signed: ${{ steps.sign.outcome == 'success' }}
     env:
       SUDOVDA_COMMIT: a4b09fa2aa731a964d0cb5d139cb1e6240e4da12
       HAVE_PFX: ${{ secrets.DRIVER_PFX_BASE64 != '' }}

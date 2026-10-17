@@ -3,8 +3,8 @@
 //! third-party/sudovda/sudovda.h + virtual_display.cpp.
 
 use std::ffi::c_void;
-use std::sync::Once;
-use std::thread::sleep;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::*;
@@ -54,7 +54,7 @@ struct ProtocolVersion {
     test_build: u8,
 }
 
-fn fail(msg: impl Into<String>) -> Error {
+pub(crate) fn fail(msg: impl Into<String>) -> Error {
     Error::new(E_FAIL, msg.into())
 }
 
@@ -153,19 +153,26 @@ impl Vda {
     }
 }
 
+/// Whether a SudoVDA is running that speaks cropcast's protocol.
+pub fn ready() -> bool {
+    Vda::open().and_then(|v| v.check_version()).is_ok()
+}
+
 /// Pings the driver every second on its own handle and thread, so the Virtual monitor
 /// outlives a busy UI but not cropcast: if the process dies, the 3 s watchdog removes it.
-fn start_watchdog() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        std::thread::spawn(|| {
-            let Ok(vda) = Vda::open() else { return };
-            loop {
-                let _ = vda.ioctl::<(), ()>(IOCTL_PING, None, None);
-                sleep(Duration::from_secs(1));
+/// Dropping the sender stops it; joining closes its handle, which removing the Driver needs.
+fn start_watchdog() -> Result<(Sender<()>, JoinHandle<()>)> {
+    let vda = Vda::open()?;
+    let (stop, stopped) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        loop {
+            let _ = vda.ioctl::<(), ()>(IOCTL_PING, None, None);
+            if stopped.recv_timeout(Duration::from_secs(1)) != Err(RecvTimeoutError::Timeout) {
+                break;
             }
-        });
+        }
     });
+    Ok((stop, thread))
 }
 
 /// `\\.\DISPLAYn` (NUL-terminated) of the active path whose target is {luid, target_id}.
@@ -203,6 +210,7 @@ fn gdi_name(out: AddOut) -> Option<Vec<u16>> {
 /// The Virtual monitor while it exists. Dropping it removes the monitor.
 pub struct Display {
     vda: Vda,
+    watchdog: Option<(Sender<()>, JoinHandle<()>)>,
     /// Where Windows put it, in desktop pixels.
     pub rect: RECT,
 }
@@ -212,7 +220,7 @@ impl Display {
     pub fn add(w: u32, h: u32, anchor: POINT) -> Result<Display> {
         let vda = Vda::open()?;
         vda.check_version()?;
-        start_watchdog();
+        let watchdog = Some(start_watchdog()?);
 
         let p = AddParams {
             width: w,
@@ -225,7 +233,7 @@ impl Display {
         let mut out = AddOut::default();
         vda.ioctl(IOCTL_ADD, Some(&p), Some(&mut out))?;
         // From here on, dropping `display` removes the monitor again.
-        let mut display = Display { vda, rect: RECT::default() };
+        let mut display = Display { vda, watchdog, rect: RECT::default() };
 
         // The path shows up in QueryDisplayConfig a little after the IOCTL returns.
         let t = Instant::now();
@@ -274,5 +282,9 @@ impl Drop for Display {
     fn drop(&mut self) {
         // If this fails, the watchdog still removes the monitor within its timeout.
         let _ = self.vda.ioctl::<_, ()>(IOCTL_REMOVE, Some(&MONITOR_GUID), None);
+        if let Some((stop, thread)) = self.watchdog.take() {
+            drop(stop);
+            let _ = thread.join();
+        }
     }
 }

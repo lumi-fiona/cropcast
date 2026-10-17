@@ -2,6 +2,7 @@
 
 mod autostart;
 mod border;
+mod driver;
 mod edit;
 mod mirror;
 mod settings;
@@ -17,8 +18,8 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
@@ -36,6 +37,7 @@ const ID_AUTOSTART: u32 = 2;
 const ID_RESET_AREA: u32 = 3;
 const ID_SHOW_BORDER: u32 = 4;
 const ID_QUIT: u32 = 5;
+const ID_REMOVE_DRIVER: u32 = 6;
 
 const ID_POLL: usize = 1;
 /// Hotkey poll interval, and the faster one while Edit mode follows the mouse.
@@ -59,6 +61,9 @@ static RECAPTURE_POSTED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 fn main() -> Result<()> {
+    if let Some(code) = driver::run_flag() {
+        std::process::exit(code);
+    }
     unsafe {
         // One cropcast per session. The handle lives as long as the process.
         let _single = CreateMutexW(None, false, w!(r"Local\cropcast"))?;
@@ -128,11 +133,11 @@ unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
     unsafe { Shell_NotifyIconW(NIM_ADD, &nid).ok() }
 }
 
-/// An error balloon from the tray icon, for things Lumi has to know about.
-fn notify_error(hwnd: HWND, title: &str, text: &str) {
+/// A balloon from the tray icon, for things Lumi has to know about.
+fn notify(hwnd: HWND, icon: NOTIFY_ICON_INFOTIP_FLAGS, title: &str, text: &str) {
     let mut nid = tray_icon(hwnd);
     nid.uFlags = NIF_INFO;
-    nid.dwInfoFlags = NIIF_ERROR;
+    nid.dwInfoFlags = icon;
     let copy = |dst: &mut [u16], s: &str| {
         let src: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
         dst[..src.len()].copy_from_slice(&src);
@@ -154,10 +159,16 @@ fn default_area() -> Area {
 }
 
 fn start_monitor(hwnd: HWND) {
+    if driver::needed()
+        && let Err(e) = driver::install()
+    {
+        notify(hwnd, NIIF_ERROR, "The Virtual monitor stays off", &e.message());
+        return;
+    }
     // Outside the borrow: adding the monitor re-enters wndproc.
     match VirtualMonitor::start(AREA.get()) {
         Ok(s) => VIRTUAL_MONITOR.set(Some(s)),
-        Err(e) => notify_error(hwnd, "The Virtual monitor couldn't start", &e.message()),
+        Err(e) => notify(hwnd, NIIF_ERROR, "The Virtual monitor couldn't start", &e.message()),
     }
 }
 
@@ -204,7 +215,7 @@ fn apply_area(hwnd: HWND) {
                 Ok(()) => VIRTUAL_MONITOR.set(Some(v)),
                 Err(e) => {
                     drop(v);
-                    notify_error(hwnd, "The Virtual monitor stopped", &e.message());
+                    notify(hwnd, NIIF_ERROR, "The Virtual monitor stopped", &e.message());
                 }
             }
         }
@@ -213,7 +224,7 @@ fn apply_area(hwnd: HWND) {
 
 fn save_area(hwnd: HWND) {
     if let Err(e) = settings::save(AREA.get()) {
-        notify_error(hwnd, "The Area couldn't be saved", &e.to_string());
+        notify(hwnd, NIIF_ERROR, "The Area couldn't be saved", &e.to_string());
     }
 }
 
@@ -240,6 +251,7 @@ unsafe fn show_menu(hwnd: HWND) -> Result<()> {
         AppendMenuW(menu, MF_STRING, ID_RESET_AREA as usize, w!("&Reset Area to 2560×1440 center"))?;
         AppendMenuW(menu, MF_STRING, ID_SHOW_BORDER as usize, w!("Show &Border briefly"))?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        AppendMenuW(menu, MF_STRING, ID_REMOVE_DRIVER as usize, w!("Remove &driver…"))?;
         AppendMenuW(menu, MF_STRING, ID_QUIT as usize, w!("&Quit"))?;
 
         let mut cursor = POINT::default();
@@ -263,7 +275,7 @@ unsafe fn show_menu(hwnd: HWND) -> Result<()> {
             ID_VIRTUAL_MONITOR => start_monitor(hwnd),
             ID_AUTOSTART => {
                 if let Err(e) = autostart::set(!autostart::enabled()) {
-                    notify_error(hwnd, "Start with Windows couldn't be changed", &e.message());
+                    notify(hwnd, NIIF_ERROR, "Start with Windows couldn't be changed", &e.message());
                 }
             }
             ID_RESET_AREA => {
@@ -273,6 +285,13 @@ unsafe fn show_menu(hwnd: HWND) -> Result<()> {
                 show_border_briefly(hwnd);
             }
             ID_SHOW_BORDER => show_border_briefly(hwnd),
+            ID_REMOVE_DRIVER => {
+                stop_monitor();
+                match driver::uninstall() {
+                    Ok(()) => notify(hwnd, NIIF_INFO, "Driver removed", "Turning the Virtual monitor on installs it again."),
+                    Err(e) => notify(hwnd, NIIF_ERROR, "The Driver is still installed", &e.message()),
+                }
+            }
             ID_QUIT => {
                 stop_monitor();
                 let _ = Shell_NotifyIconW(NIM_DELETE, &tray_icon(hwnd));
@@ -304,7 +323,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(e) = failed {
                     // A dead capture would freeze the stream; better off and said so.
                     stop_monitor();
-                    notify_error(hwnd, "The Virtual monitor stopped", &e.message());
+                    notify(hwnd, NIIF_ERROR, "The Virtual monitor stopped", &e.message());
                 }
                 LRESULT(0)
             }
