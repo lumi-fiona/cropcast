@@ -40,7 +40,8 @@ jobs:
           ref: ${{ env.SUDOVDA_COMMIT }}
           path: sudovda
           persist-credentials: false
-      - run: |
+      - name: Build SudoVDA
+        run: |
           $PSNativeCommandUseErrorActionPreference = $true
           # 64-bit MSBuild: the x86 one can't load the WDK's x86\InfVerif.dll on this image.
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find MSBuild\**\Bin\amd64\MSBuild.exe
@@ -51,7 +52,8 @@ jobs:
           Copy-Item "$out\SudoVDA.inf", "$out\SudoVDA.dll", "$out\sudovda.cat" driver
           Get-ChildItem driver
       # Secrets only on pushes to this repo; forks and PRs get an unsigned package.
-      - id: sign
+      - name: Sign the catalog
+        id: sign
         if: github.event_name == 'push' && env.HAVE_PFX == 'true'
         env:
           PFX_BASE64: ${{ secrets.DRIVER_PFX_BASE64 }}
