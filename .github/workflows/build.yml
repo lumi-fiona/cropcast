@@ -44,11 +44,11 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           # 64-bit MSBuild: the x86 one can't load the WDK's x86\InfVerif.dll on this image.
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find MSBuild\**\Bin\amd64\MSBuild.exe
+          # The WDK build stamps the INF and runs Inf2Cat itself; SignMode=Off skips its test signing.
           & $msbuild "sudovda\Virtual Display Driver (HDR)\SudoVDA.sln" /m /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off
           $out = "sudovda\Virtual Display Driver (HDR)\x64\Release\SudoVDA"
           New-Item -ItemType Directory driver | Out-Null
-          Copy-Item "$out\SudoVDA.inf", "$out\SudoVDA.dll" driver
-          & "${env:ProgramFiles(x86)}\Windows Kits\10\bin\x86\Inf2Cat.exe" /driver:driver /os:10_X64
+          Copy-Item "$out\SudoVDA.inf", "$out\SudoVDA.dll", "$out\sudovda.cat" driver
           Get-ChildItem driver
       # Secrets only on pushes to this repo; forks and PRs get an unsigned package.
       - id: sign
