@@ -14,3 +14,7 @@ The state while the hotkey (Ctrl+Alt) is held: the Border shows and the Area can
 **Virtual monitor**
 The extra screen cropcast adds to Windows, exactly the size of the Area, which carries the Area's picture. It's what Discord's "Screen" share is pointed at. It's also cropcast's on/off state, toggled from the tray: while the Virtual monitor is on, it exists and mirrors the Area; while it's off, it doesn't exist and the desktop is untouched.
 _Avoid_: fake display, second screen, virtual desktop (Windows' Win+Tab desktops), Sharing (that's Discord's act, not cropcast's)
+
+**Driver**
+The virtual display driver cropcast installs, once, so the Virtual monitor can exist. Installing or removing it is the only thing cropcast asks admin rights for.
+_Avoid_: VDA, display adapter
