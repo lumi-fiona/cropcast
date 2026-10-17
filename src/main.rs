@@ -205,11 +205,10 @@ fn tick(hwnd: HWND) {
     }
 }
 
-/// Puts the Virtual monitor, if on, on the Area. A resize removes and re-adds it at the new size,
-/// which restarts WGC too.
+/// Puts the Virtual monitor, if on, on the Area. A resize changes its mode, which restarts WGC too.
 fn apply_area(hwnd: HWND) {
     if !VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_none_or(|v| v.set_area(AREA.get()))) {
-        // Out of the cell while resizing: re-adding the monitor re-enters wndproc.
+        // Out of the cell while resizing: a mode change re-enters wndproc.
         if let Some(mut v) = VIRTUAL_MONITOR.take() {
             match v.resize(AREA.get()) {
                 Ok(()) => VIRTUAL_MONITOR.set(Some(v)),

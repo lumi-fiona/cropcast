@@ -1,6 +1,7 @@
 //! SudoVDA control: open the device, add/remove the Virtual monitor, set its mode and position.
-//! IOCTL layout from SudoVDA Common/Include/sudovda-ioctl.h, call sequence from Apollo's
-//! third-party/sudovda/sudovda.h + virtual_display.cpp.
+//! IOCTL layout from SudoVDA Common/Include/sudovda-ioctl.h (IOCTL_UPDATE_MODE from cropcast's
+//! fork, lumi-fiona/SudoVDA), call sequence from Apollo's third-party/sudovda/sudovda.h +
+//! virtual_display.cpp.
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -25,6 +26,7 @@ const fn ctl(f: u32) -> u32 {
 }
 const IOCTL_ADD: u32 = ctl(0x800);
 const IOCTL_REMOVE: u32 = ctl(0x801);
+const IOCTL_UPDATE_MODE: u32 = ctl(0x804);
 const IOCTL_PING: u32 = ctl(0x888);
 const IOCTL_GET_PROTOCOL_VERSION: u32 = ctl(0x8FF);
 
@@ -37,6 +39,15 @@ struct AddParams {
     device_name: [u8; 14],
     serial_number: [u8; 14],
 }
+
+#[repr(C)]
+struct UpdateModeParams {
+    monitor_guid: GUID,
+    width: u32,
+    height: u32,
+    refresh_rate: u32,
+}
+const _: () = assert!(IOCTL_UPDATE_MODE == 0x222010 && size_of::<UpdateModeParams>() == 28);
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -139,13 +150,14 @@ impl Vda {
         }
     }
 
-    /// Refuses a major mismatch or an older minor (Apollo's rule): the structs above are 0.2.x.
+    /// Refuses a major mismatch or an older minor (Apollo's rule): the structs above are 0.3.x,
+    /// which only cropcast's fork speaks, so a stock 0.2.x SudoVDA gets the Driver installed over it.
     fn check_version(&self) -> Result<()> {
         let mut v = ProtocolVersion::default();
         self.ioctl::<(), _>(IOCTL_GET_PROTOCOL_VERSION, None, Some(&mut v))?;
-        if v.major != 0 || v.minor < 2 {
+        if v.major != 0 || v.minor < 3 {
             return Err(fail(format!(
-                "This SudoVDA speaks protocol {}.{}.{}; cropcast needs 0.2.x.",
+                "This SudoVDA speaks protocol {}.{}.{}; cropcast needs 0.3.x.",
                 v.major, v.minor, v.incremental
             )));
         }
@@ -211,6 +223,8 @@ fn gdi_name(out: AddOut) -> Option<Vec<u16>> {
 pub struct Display {
     vda: Vda,
     watchdog: Option<(Sender<()>, JoinHandle<()>)>,
+    /// `\\.\DISPLAYn`, NUL-terminated.
+    pub name: Vec<u16>,
     /// Where Windows put it, in desktop pixels.
     pub rect: RECT,
 }
@@ -233,12 +247,12 @@ impl Display {
         let mut out = AddOut::default();
         vda.ioctl(IOCTL_ADD, Some(&p), Some(&mut out))?;
         // From here on, dropping `display` removes the monitor again.
-        let mut display = Display { vda, watchdog, rect: RECT::default() };
+        let mut display = Display { vda, watchdog, name: Vec::new(), rect: RECT::default() };
 
         // The path shows up in QueryDisplayConfig a little after the IOCTL returns.
         let t = Instant::now();
         let mut delay = 20;
-        let name = loop {
+        display.name = loop {
             if let Some(n) = gdi_name(out) {
                 break n;
             }
@@ -249,32 +263,51 @@ impl Display {
             delay = (delay * 2).min(320);
         };
 
-        unsafe {
-            let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
-            dm.dmPelsWidth = w;
-            dm.dmPelsHeight = h;
-            dm.dmDisplayFrequency = 60;
-            dm.Anonymous1.Anonymous2.dmPosition = POINTL { x: anchor.x, y: anchor.y };
-            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_POSITION;
-            // Never CDS_SET_PRIMARY.
-            let r = ChangeDisplaySettingsExW(PCWSTR(name.as_ptr()), Some(&dm), None, CDS_UPDATEREGISTRY, None);
-            if r != DISP_CHANGE_SUCCESSFUL {
-                return Err(fail(format!("Windows refused {w}×{h} for the Virtual monitor (code {}).", r.0)));
-            }
-            // Read back what Windows actually applied: that's where the presenter has to go.
-            let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
-            if !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
-                return Err(fail("Couldn't read the Virtual monitor's mode back."));
-            }
-            let pos = dm.Anonymous1.Anonymous2.dmPosition;
-            display.rect = RECT {
-                left: pos.x,
-                top: pos.y,
-                right: pos.x + dm.dmPelsWidth as i32,
-                bottom: pos.y + dm.dmPelsHeight as i32,
-            };
-        }
+        display.rect = set_mode(&display.name, w, h, anchor)?;
         Ok(display)
+    }
+
+    /// Changes the live monitor to `w`×`h`@60, keeping its top-left, so Windows (and Discord) see
+    /// the same monitor. Fails if Windows won't take that size.
+    pub fn update_mode(&mut self, w: u32, h: u32) -> Result<()> {
+        self.offer_mode(w, h)?;
+        self.rect = set_mode(&self.name, w, h, POINT { x: self.rect.left, y: self.rect.top })?;
+        let r = self.rect;
+        if (r.right - r.left, r.bottom - r.top) != (w as i32, h as i32) {
+            return Err(fail(format!("Windows put the Virtual monitor at {}×{}, not {w}×{h}.", r.right - r.left, r.bottom - r.top)));
+        }
+        Ok(())
+    }
+
+    /// Makes `w`×`h`@60 the Driver's preferred mode for the monitor and pushes its new mode list to
+    /// Windows. Doesn't switch to it: `update_mode` does.
+    pub fn offer_mode(&self, w: u32, h: u32) -> Result<()> {
+        let p = UpdateModeParams { monitor_guid: MONITOR_GUID, width: w, height: h, refresh_rate: 60 };
+        self.vda.ioctl::<_, ()>(IOCTL_UPDATE_MODE, Some(&p), None)
+    }
+}
+
+/// Switches `name` to `w`×`h`@60 with its top-left at `pos`, and returns where Windows put it.
+fn set_mode(name: &[u16], w: u32, h: u32, pos: POINT) -> Result<RECT> {
+    unsafe {
+        let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        dm.dmPelsWidth = w;
+        dm.dmPelsHeight = h;
+        dm.dmDisplayFrequency = 60;
+        dm.Anonymous1.Anonymous2.dmPosition = POINTL { x: pos.x, y: pos.y };
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_POSITION;
+        // Never CDS_SET_PRIMARY.
+        let r = ChangeDisplaySettingsExW(PCWSTR(name.as_ptr()), Some(&dm), None, CDS_UPDATEREGISTRY, None);
+        if r != DISP_CHANGE_SUCCESSFUL {
+            return Err(fail(format!("Windows refused {w}×{h} for the Virtual monitor (code {}).", r.0)));
+        }
+        // Read back what Windows actually applied: that's where the presenter has to go.
+        let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+            return Err(fail("Couldn't read the Virtual monitor's mode back."));
+        }
+        let pos = dm.Anonymous1.Anonymous2.dmPosition;
+        Ok(RECT { left: pos.x, top: pos.y, right: pos.x + dm.dmPelsWidth as i32, bottom: pos.y + dm.dmPelsHeight as i32 })
     }
 }
 
