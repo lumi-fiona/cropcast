@@ -18,7 +18,8 @@ pub struct VirtualMonitor {
     mirror: Arc<Mutex<Mirror>>,
     presenter: Presenter,
     gpu: Gpu,
-    _display: Display,
+    /// None only for the moment a resize swaps it.
+    display: Option<Display>,
 }
 
 impl VirtualMonitor {
@@ -29,9 +30,50 @@ impl VirtualMonitor {
         let gpu = mirror::create_device()?;
         let presenter = Presenter::new(display.rect)?;
         let mirror = Arc::new(Mutex::new(Mirror::new(&gpu, presenter.0, area)?));
-        let mut vm = VirtualMonitor { capture: None, mirror, presenter, gpu, _display: display };
+        let mut vm = VirtualMonitor { capture: None, mirror, presenter, gpu, display: Some(display) };
         vm.recapture()?;
         Ok(vm)
+    }
+
+    /// Re-adds the Virtual monitor at `area`'s size, keeping the presenter, device and swapchain
+    /// so the gap stays short (~0.5 s in the spike). A longer gap ends Discord's share.
+    pub fn resize(&mut self, area: Area) -> Result<()> {
+        self.capture = None;
+        self.mirror.lock().unwrap().presenting = false;
+        unsafe {
+            // Hide before the monitor goes, or Windows moves the window onto the real screen.
+            let _ = ShowWindow(self.presenter.0, SW_HIDE);
+        }
+        self.display = None;
+        self.mirror.lock().unwrap().resize(area)?;
+        let real = real_monitor();
+        let display = Display::add(area.w, area.h, POINT { x: real.right, y: real.bottom })?;
+        let r = display.rect;
+        self.display = Some(display);
+        unsafe {
+            SetWindowPos(
+                self.presenter.0,
+                Some(HWND_TOPMOST),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )?;
+        }
+        self.mirror.lock().unwrap().presenting = true;
+        self.recapture()
+    }
+
+    /// Points the copy box at `area` if it has the Virtual monitor's size (a live move); false if
+    /// it needs a new monitor.
+    pub fn set_area(&self, area: Area) -> bool {
+        let mut m = self.mirror.lock().unwrap();
+        let fits = (m.area.w, m.area.h) == (area.w, area.h);
+        if fits {
+            m.area = area;
+        }
+        fits
     }
 
     /// Any monitor add, remove or mode change kills the WGC capture of the real monitor and
