@@ -199,6 +199,8 @@ mod tests {
         assert_eq!(Area::default_for(5120, 1440), Area { x: 1280, y: 0, w: 2560, h: 1440 });
         assert_eq!(Area::default_for(1920, 1080), Area { x: 0, y: 0, w: 1920, h: 1080 });
         assert_eq!(Area::default_for(1366, 767), Area { x: 0, y: 0, w: 1366, h: 766 });
+        // No real monitor for a moment (it went away): an empty Area, refitted when it's back.
+        assert_eq!(Area::default_for(0, 0), Area { x: 0, y: 0, w: 0, h: 0 });
     }
 
     #[test]

@@ -223,6 +223,8 @@ fn gdi_name(out: AddOut) -> Option<Vec<u16>> {
 pub struct Display {
     vda: Vda,
     watchdog: Option<(Sender<()>, JoinHandle<()>)>,
+    /// The adapter and target the Driver gave it.
+    out: AddOut,
     /// `\\.\DISPLAYn`, NUL-terminated.
     pub name: Vec<u16>,
     /// Where Windows put it, in desktop pixels.
@@ -247,7 +249,7 @@ impl Display {
         let mut out = AddOut::default();
         vda.ioctl(IOCTL_ADD, Some(&p), Some(&mut out))?;
         // From here on, dropping `display` removes the monitor again.
-        let mut display = Display { vda, watchdog, name: Vec::new(), rect: RECT::default() };
+        let mut display = Display { vda, watchdog, out, name: Vec::new(), rect: RECT::default() };
 
         // The path shows up in QueryDisplayConfig a little after the IOCTL returns.
         let t = Instant::now();
@@ -267,16 +269,30 @@ impl Display {
         Ok(display)
     }
 
-    /// Changes the live monitor to `w`×`h`@60, keeping its top-left, so Windows (and Discord) see
-    /// the same monitor. Fails if Windows won't take that size.
-    pub fn update_mode(&mut self, w: u32, h: u32) -> Result<()> {
+    /// Changes the live monitor to `w`×`h`@60 with its top-left at `anchor`, so Windows (and Discord)
+    /// see the same monitor. Fails if Windows won't take that size.
+    pub fn update_mode(&mut self, w: u32, h: u32, anchor: POINT) -> Result<()> {
         self.offer_mode(w, h)?;
-        self.rect = set_mode(&self.name, w, h, POINT { x: self.rect.left, y: self.rect.top })?;
+        self.rect = set_mode(&self.name, w, h, anchor)?;
         let r = self.rect;
         if (r.right - r.left, r.bottom - r.top) != (w as i32, h as i32) {
             return Err(fail(format!("Windows put the Virtual monitor at {}×{}, not {w}×{h}.", r.right - r.left, r.bottom - r.top)));
         }
         Ok(())
+    }
+
+    /// Whether Windows still has this monitor up, and not as the primary, which it becomes when the
+    /// real monitor goes away. It's gone when the Driver is removed or its watchdog timed out.
+    pub fn alive(&self) -> bool {
+        let primary = unsafe {
+            let mut mi = MONITORINFOEXW::default();
+            mi.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+            let _ = GetMonitorInfoW(monitor, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO);
+            mi.szDevice
+        };
+        // Both NUL-terminated, so \\.\DISPLAY1 doesn't match \\.\DISPLAY12.
+        gdi_name(self.out).is_some_and(|n| n == self.name) && !primary.starts_with(&self.name)
     }
 
     /// Makes `w`×`h`@60 the Driver's preferred mode for the monitor and pushes its new mode list to
