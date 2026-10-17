@@ -108,6 +108,16 @@ impl Mirror {
         }
     }
 
+    /// New swapchain size for a resized Area. No back buffer is held between frames.
+    pub fn resize(&mut self, area: Area) -> Result<()> {
+        unsafe {
+            let flags = DXGI_SWAP_CHAIN_FLAG(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0);
+            self.swap.ResizeBuffers(2, area.w, area.h, DXGI_FORMAT_B8G8R8A8_UNORM, flags)?;
+        }
+        self.area = area;
+        Ok(())
+    }
+
     /// One frame: wait for the swapchain, copy the Area box, black out any part off the source.
     fn present(&mut self, src: &ID3D11Texture2D) -> Result<()> {
         if !self.presenting {

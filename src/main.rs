@@ -171,8 +171,16 @@ fn tick(hwnd: HWND) {
         drop(s); // hides the Border
         // A resize: remove and re-add the Virtual monitor at the new size, which restarts WGC too.
         if !VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_none_or(|v| v.set_area(AREA.get()))) {
-            stop_monitor();
-            start_monitor(hwnd);
+            // Out of the cell while resizing: re-adding the monitor re-enters wndproc.
+            if let Some(mut v) = VIRTUAL_MONITOR.take() {
+                match v.resize(AREA.get()) {
+                    Ok(()) => VIRTUAL_MONITOR.set(Some(v)),
+                    Err(e) => {
+                        drop(v);
+                        notify_error(hwnd, "The Virtual monitor stopped", &e.message());
+                    }
+                }
+            }
         }
         unsafe { SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None) };
     }
