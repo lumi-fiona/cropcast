@@ -28,7 +28,8 @@ jobs:
           name: cropcast
           path: target/release/cropcast.exe
       - if: startsWith(github.ref, 'refs/tags/v')
-        run: gh release create "$env:GITHUB_REF_NAME" target/release/cropcast.exe --generate-notes
+        # A tag with a dash (v1.1.0-beta.1) is a pre-release.
+        run: gh release create "$env:GITHUB_REF_NAME" target/release/cropcast.exe --generate-notes ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}
         env:
           GH_TOKEN: ${{ github.token }}
 

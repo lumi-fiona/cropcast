@@ -394,7 +394,10 @@ impl Border {
             )?;
             // Owned from here, so a failure below destroys the window too.
             let guard = HwndGuard(hwnd);
-            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;
+            // --demo leaves the Border capturable, so a screen recorder can film it for the README GIF.
+            if !std::env::args().any(|a| a == "--demo") {
+                SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;
+            }
 
             let kit = Kit::new()?;
             let dxgi: IDXGIDevice = create_device()?.device.cast()?;
