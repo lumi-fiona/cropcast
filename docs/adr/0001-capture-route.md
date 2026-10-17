@@ -8,7 +8,7 @@ Discord can share a whole screen (with system audio) or a single window, never p
 
 ## Decision
 
-While Sharing is on, cropcast adds a Virtual monitor exactly the size of the Area and paints the Area into a window on it at 60 fps. Discord shares that screen.
+While the Virtual monitor is on, cropcast adds a Virtual monitor exactly the size of the Area and paints the Area into a window on it at 60 fps. Discord shares that screen.
 
 - **Driver:** stock SudoVDA, built and signed in CI. Monitors are added and removed by IOCTL at any size; a 3 s watchdog ping keeps them alive.
 - **Capture:** Windows.Graphics.Capture of the real monitor (cursor on, capture border off, ~16 ms interval, BGRA8).
