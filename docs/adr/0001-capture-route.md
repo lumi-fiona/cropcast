@@ -1,6 +1,6 @@
 # 0001 — Mirror the Area through a window on a Virtual monitor
 
-Status: accepted, 2026-10-16 ([Lock the capture route](https://github.com/lumi-fiona/cropcast/issues/5))
+Status: accepted, 2026-10-16 ([Lock the capture route](https://github.com/lumi-fiona/cropcast/issues/5)); amended 2026-10-17: resize by mode change, not re-add
 
 ## Context
 
@@ -10,10 +10,10 @@ Discord can share a whole screen (with system audio) or a single window, never p
 
 When turned on, cropcast adds a Virtual monitor exactly the size of the Area and paints the Area into a window on it at 60 fps. Discord shares that screen.
 
-- **Driver:** stock SudoVDA, built and signed in CI. Monitors are added and removed by IOCTL at any size; a 3 s watchdog ping keeps them alive.
+- **Driver:** SudoVDA, forked to add one IOCTL that changes a live monitor's mode (`IddCxMonitorUpdateModes2`), built and signed in CI. Monitors are added and removed by IOCTL at any size; a 3 s watchdog ping keeps them alive.
 - **Capture:** Windows.Graphics.Capture of the real monitor (cursor on, capture border off, ~16 ms interval, BGRA8).
 - **Present:** one GPU copy of the Area per frame into a flip-model swapchain on a borderless, topmost, no-activate window covering the Virtual monitor.
-- **Edit mode:** a move only shifts the copy box and is live. A resize removes and re-adds the Virtual monitor at the new size, once, when Edit mode ends.
+- **Edit mode:** a move only shifts the copy box and is live. A resize changes the Virtual monitor's mode in place, once, when Edit mode ends. It never removes and re-adds it, because Discord pauses the share when the monitor is unplugged (tested 2026-10-17: remove + re-add pauses it, a mode change on the same monitor keeps it).
 - **Sizes:** the Area is always an even number of pixels wide and tall (video encoders need it), so nothing is padded.
 - **Placement:** the Virtual monitor touches the real one only at its bottom-right corner, so the cursor and new windows rarely wander onto it.
 
@@ -21,11 +21,11 @@ When turned on, cropcast adds a Virtual monitor exactly the size of the Area and
 
 - **Feeding frames into the driver directly:** Discord captures the screen from DWM, before the driver sees any frame, so viewers would never see them.
 - **DXGI Desktop Duplication:** it drops capture on every mode change and needs the cursor drawn by hand. Supporting older Windows is out of scope for v1.
-- **Forking SudoVDA for live resize up front:** only if the spike shows that remove + re-add ends the Discord share.
 - **Confining the cursor with `ClipCursor`:** it fights games and other apps.
 
 ## Consequences
 
-- A resize briefly glitches the stream; Discord rebuilds its capture.
+- A resize briefly glitches the stream; Discord keeps sharing because it's the same monitor.
+- cropcast owns a small SudoVDA fork and has to keep it building.
 - Anything else that lands on the Virtual monitor (a stray window, the taskbar, the cursor) is seen by viewers.
 - Accepted v1 limits: a sharp stream needs Nitro with the Source preset (or an Area that fits 1440p); exclusive-fullscreen games may mirror black; SDR only; no admin-only realtime GPU priority.
