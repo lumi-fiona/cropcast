@@ -6,6 +6,7 @@ mod driver;
 mod edit;
 mod mirror;
 mod settings;
+mod tray_look;
 mod virtual_monitor;
 mod vda;
 
@@ -59,6 +60,8 @@ thread_local! {
 }
 static RECAPTURE_POSTED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Whether the tray icon shows the Virtual monitor on.
+static ICON_ON: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     if let Some(code) = driver::run_flag() {
@@ -102,6 +105,7 @@ fn main() -> Result<()> {
             Some(instance.into()),
             None,
         )?;
+        tray_look::follow_system_theme(hwnd);
         add_tray_icon(hwnd)?;
         SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None);
 
@@ -126,11 +130,27 @@ unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
     let mut nid = tray_icon(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    // ponytail: stock icon until the Border look ticket designs one.
-    nid.hIcon = unsafe { LoadIconW(None, IDI_APPLICATION)? };
+    let on = monitor_on();
+    ICON_ON.store(on, Ordering::Relaxed);
+    nid.hIcon = tray_look::icon(on)?;
     let tip: Vec<u16> = "cropcast".encode_utf16().collect();
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     unsafe { Shell_NotifyIconW(NIM_ADD, &nid).ok() }
+}
+
+/// Swaps the tray icon when the Virtual monitor turns on or off, or always on `restyle` (a theme change).
+fn update_tray_icon(hwnd: HWND, restyle: bool) {
+    let on = monitor_on();
+    if ICON_ON.swap(on, Ordering::Relaxed) == on && !restyle {
+        return;
+    }
+    let Ok(icon) = tray_look::icon(on) else { return };
+    let mut nid = tray_icon(hwnd);
+    nid.uFlags = NIF_ICON;
+    nid.hIcon = icon;
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
 }
 
 /// A balloon from the tray icon, for things Lumi has to know about.
@@ -232,9 +252,9 @@ fn show_border_briefly(hwnd: HWND) {
     if EDIT.with_borrow(|e| e.is_some()) {
         return;
     }
-    let Ok(mut b) = border::Border::new() else { return };
+    let Ok(mut b) = border::Border::new(virtual_monitor::real_monitor()) else { return };
     b.pass_clicks();
-    if b.show(AREA.get()).is_ok() {
+    if b.show(AREA.get(), None, None).is_ok() {
         drop(FLASH.replace(Some(b)));
         unsafe { SetTimer(Some(hwnd), ID_FLASH, FLASH_MS, None) };
     }
@@ -333,11 +353,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_TIMER => {
                 tick(hwnd);
+                // Catches every way the Virtual monitor turns on or off.
+                update_tray_icon(hwnd, false);
                 LRESULT(0)
             }
             WM_HELLO => {
                 show_border_briefly(hwnd);
                 LRESULT(0)
+            }
+            WM_SETTINGCHANGE if lparam.0 != 0 && PCWSTR(lparam.0 as *const u16).to_string().is_ok_and(|s| s == "ImmersiveColorSet") => {
+                // Light or dark mode changed: the menu and the icon follow.
+                tray_look::follow_system_theme(hwnd);
+                update_tray_icon(hwnd, true);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_ENDSESSION if wparam.0 != 0 => {
                 stop_monitor();

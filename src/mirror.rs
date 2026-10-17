@@ -46,7 +46,7 @@ impl Area {
 }
 
 pub struct Gpu {
-    device: ID3D11Device,
+    pub device: ID3D11Device,
     ctx: ID3D11DeviceContext,
 }
 
