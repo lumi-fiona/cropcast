@@ -24,9 +24,7 @@ pub struct VirtualMonitor {
 
 impl VirtualMonitor {
     pub fn start(area: Area) -> Result<VirtualMonitor> {
-        let real = real_monitor();
-        // Touch the real monitor only at its bottom-right corner, so the cursor can't wander over.
-        let display = Display::add(area.w, area.h, POINT { x: real.right, y: real.bottom })?;
+        let display = Display::add(area.w, area.h, corner())?;
         let gpu = mirror::create_device()?;
         let presenter = Presenter::new(display.rect)?;
         let mirror = Arc::new(Mutex::new(Mirror::new(&gpu, presenter.0, area)?));
@@ -36,10 +34,11 @@ impl VirtualMonitor {
     }
 
     /// Changes the Virtual monitor's mode to `area`'s size in place, so Discord keeps sharing it,
-    /// keeping the presenter, device and swapchain.
+    /// keeping the presenter, device and swapchain. Also puts it back at the real monitor's corner,
+    /// which moves when the real monitor changes resolution.
     pub fn resize(&mut self, area: Area) -> Result<()> {
         self.capture = None;
-        if !self.display.as_mut().is_some_and(|d| d.update_mode(area.w, area.h).is_ok()) {
+        if !self.display.as_mut().is_some_and(|d| d.update_mode(area.w, area.h, corner()).is_ok()) {
             // ponytail: Windows may refuse a size it didn't list when the monitor arrived. Then this
             // re-adds the monitor at the new size, which pauses Discord's share. Delete once
             // examples/mode_probe.rs shows arbitrary sizes work live.
@@ -49,8 +48,7 @@ impl VirtualMonitor {
                 let _ = ShowWindow(self.presenter.0, SW_HIDE);
             }
             self.display = None;
-            let real = real_monitor();
-            self.display = Some(Display::add(area.w, area.h, POINT { x: real.right, y: real.bottom })?);
+            self.display = Some(Display::add(area.w, area.h, corner())?);
         }
         self.mirror.lock().unwrap().resize(area)?;
         let r = self.display.as_ref().unwrap().rect;
@@ -88,6 +86,11 @@ impl VirtualMonitor {
         self.capture = Some(mirror::start_capture(&self.gpu, monitor, self.mirror.clone())?);
         Ok(())
     }
+
+    /// False once Windows has dropped the Virtual monitor, or made it the primary.
+    pub fn alive(&self) -> bool {
+        self.display.as_ref().is_some_and(|d| d.alive())
+    }
 }
 
 impl Drop for VirtualMonitor {
@@ -109,6 +112,13 @@ pub fn real_monitor() -> RECT {
         let _ = GetMonitorInfoW(monitor, &mut mi);
         mi.rcMonitor
     }
+}
+
+/// Where the Virtual monitor's top-left goes: touching the real monitor only at its bottom-right
+/// corner, so the cursor can't wander over.
+fn corner() -> POINT {
+    let real = real_monitor();
+    POINT { x: real.right, y: real.bottom }
 }
 
 /// The borderless, topmost, never-focused window covering the Virtual monitor. Discord shares

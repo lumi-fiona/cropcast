@@ -19,8 +19,9 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
@@ -46,13 +47,18 @@ const POLL_IDLE_MS: u32 = 50;
 const POLL_EDIT_MS: u32 = 15; // one 15.6 ms system tick, about 60 Hz
 const ID_FLASH: usize = 2;
 const FLASH_MS: u32 = 1500;
+const ID_FULLSCREEN: usize = 3;
+const FULLSCREEN_MS: u32 = 2000;
 
 thread_local! {
     /// Some while the Virtual monitor is on. Only the UI thread touches it, and never across a call that
     /// can re-enter the window procedure (adding a monitor sends WM_DISPLAYCHANGE).
     static VIRTUAL_MONITOR: RefCell<Option<VirtualMonitor>> = const { RefCell::new(None) };
     /// The Area, kept while the Virtual monitor is off too. Edit mode changes it on release.
-    static AREA: Cell<Area> = Cell::new(settings::load().unwrap_or_else(default_area));
+    static AREA: Cell<Area> = Cell::new(saved_area());
+    /// The real monitor's size the Area was last fitted to. Our own adds and mode changes never
+    /// change it, so a new size means the real monitor itself changed.
+    static REAL: Cell<(i32, i32)> = const { Cell::new((0, 0)) }; // set at startup
     /// Some while Edit mode is on.
     static EDIT: RefCell<Option<edit::Session>> = const { RefCell::new(None) };
     /// Some while Show Border briefly shows it.
@@ -62,6 +68,8 @@ static RECAPTURE_POSTED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// Whether the tray icon shows the Virtual monitor on.
 static ICON_ON: AtomicBool = AtomicBool::new(false);
+/// The exclusive-fullscreen warning shows once per run.
+static FULLSCREEN_SAID: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     if let Some(code) = driver::run_flag() {
@@ -107,7 +115,9 @@ fn main() -> Result<()> {
         )?;
         tray_look::follow_system_theme(hwnd);
         add_tray_icon(hwnd)?;
+        REAL.set(real_size());
         SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None);
+        SetTimer(Some(hwnd), ID_FULLSCREEN, FULLSCREEN_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -173,9 +183,20 @@ fn monitor_on() -> bool {
     VIRTUAL_MONITOR.with_borrow(|s| s.is_some())
 }
 
-fn default_area() -> Area {
+fn real_size() -> (i32, i32) {
     let r = virtual_monitor::real_monitor();
-    Area::default_for((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+    (r.right - r.left, r.bottom - r.top)
+}
+
+fn default_area() -> Area {
+    let (w, h) = real_size();
+    Area::default_for(w as u32, h as u32)
+}
+
+/// The saved Area moved onto the real monitor, or the default if it doesn't fit. From the file, not
+/// AREA, so the Area a lower resolution shrank comes back with the higher one.
+fn saved_area() -> Area {
+    settings::load().unwrap_or_else(default_area)
 }
 
 fn start_monitor(hwnd: HWND) {
@@ -220,14 +241,15 @@ fn tick(hwnd: HWND) {
         if changed {
             save_area(hwnd);
         }
-        apply_area(hwnd);
+        apply_area(hwnd, false);
         unsafe { SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None) };
     }
 }
 
 /// Puts the Virtual monitor, if on, on the Area. A resize changes its mode, which restarts WGC too.
-fn apply_area(hwnd: HWND) {
-    if !VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_none_or(|v| v.set_area(AREA.get()))) {
+/// `replace` resizes even at the same size, to put it back at the real monitor's corner.
+fn apply_area(hwnd: HWND, replace: bool) {
+    if !VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_none_or(|v| !replace && v.set_area(AREA.get()))) {
         // Out of the cell while resizing: a mode change re-enters wndproc.
         if let Some(mut v) = VIRTUAL_MONITOR.take() {
             match v.resize(AREA.get()) {
@@ -238,6 +260,44 @@ fn apply_area(hwnd: HWND) {
                 }
             }
         }
+    }
+}
+
+/// Coalesces: one add sends several WM_DISPLAYCHANGEs, and one look after them is enough.
+fn post_recapture(hwnd: HWND) {
+    if !RECAPTURE_POSTED.swap(true, Ordering::Relaxed) {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_RECAPTURE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// After display changes, ours included: refits the Area when the real monitor changed size, and
+/// restarts the capture, or turns the Virtual monitor off once Windows has dropped it.
+fn display_changed(hwnd: HWND) {
+    let size = real_size();
+    let resized = REAL.replace(size) != size;
+    if resized {
+        // Not saved: the file keeps the Area chosen at the old resolution, for when it comes back.
+        AREA.set(saved_area());
+    }
+    let failed = if VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_some_and(|v| !v.alive())) {
+        // Its presenter would land on the real monitor, covering it with a mirror of itself.
+        Some(if vda::ready() {
+            "Windows removed it, or the real monitor went away. Turn it on again from the tray.".to_string()
+        } else {
+            "The Driver went away. Turning the Virtual monitor on installs it again.".to_string()
+        })
+    } else if resized {
+        apply_area(hwnd, true); // says so itself if it fails
+        None
+    } else {
+        VIRTUAL_MONITOR.with_borrow_mut(|s| s.as_mut().and_then(|s| s.recapture().err())).map(|e| e.message())
+    };
+    if let Some(why) = failed {
+        // A dead capture would freeze the stream; better off and said so.
+        stop_monitor();
+        notify(hwnd, NIIF_ERROR, "The Virtual monitor stopped", &why);
     }
 }
 
@@ -300,7 +360,7 @@ unsafe fn show_menu(hwnd: HWND) -> Result<()> {
             ID_RESET_AREA => {
                 AREA.set(default_area());
                 save_area(hwnd);
-                apply_area(hwnd);
+                apply_area(hwnd, false);
                 show_border_briefly(hwnd);
             }
             ID_SHOW_BORDER => show_border_briefly(hwnd),
@@ -330,19 +390,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE => {
-                // Coalesce: one add sends several of these, one fresh capture after them is enough.
-                if monitor_on() && !RECAPTURE_POSTED.swap(true, Ordering::Relaxed) {
-                    let _ = PostMessageW(Some(hwnd), WM_RECAPTURE, WPARAM(0), LPARAM(0));
-                }
+                post_recapture(hwnd);
                 DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC => {
+                // Back from sleep: check the Virtual monitor survived, and restart the capture.
+                post_recapture(hwnd);
+                LRESULT(1)
             }
             WM_RECAPTURE => {
                 RECAPTURE_POSTED.store(false, Ordering::Relaxed);
-                let failed = VIRTUAL_MONITOR.with_borrow_mut(|s| s.as_mut().and_then(|s| s.recapture().err()));
-                if let Some(e) = failed {
-                    // A dead capture would freeze the stream; better off and said so.
-                    stop_monitor();
-                    notify(hwnd, NIIF_ERROR, "The Virtual monitor stopped", &e.message());
+                display_changed(hwnd);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == ID_FULLSCREEN => {
+                // Discord's own test for a game WGC can't see. Windows also says yes for a game it
+                // quietly runs borderless (fullscreen optimizations), which mirrors fine, hence "may".
+                if monitor_on()
+                    && SHQueryUserNotificationState().is_ok_and(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN)
+                    && !FULLSCREEN_SAID.swap(true, Ordering::Relaxed)
+                {
+                    notify(
+                        hwnd,
+                        NIIF_WARNING,
+                        "A game is in exclusive fullscreen",
+                        "Viewers may see black or a frozen picture. Set the game to borderless or windowed to share it.",
+                    );
                 }
                 LRESULT(0)
             }

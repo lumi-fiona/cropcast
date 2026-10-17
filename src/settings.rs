@@ -77,5 +77,13 @@ mod tests {
     #[test]
     fn a_monitor_smaller_than_the_saved_area_falls_back() {
         assert_eq!(parse("0 0 2560 1440", (1920, 1080)), None);
+        assert_eq!(parse("0 0 2560 1440", (0, 0)), None); // no real monitor at all
+    }
+
+    #[test]
+    fn a_lower_resolution_keeps_a_saved_area_that_fits() {
+        // The real monitor going 5120×1440 → 2560×1440 moves the centered Area to the left edge.
+        assert_eq!(parse("1280 0 2560 1440", (2560, 1440)), Some(Area { x: 0, y: 0, w: 2560, h: 1440 }));
+        assert_eq!(parse("3000 600 1000 800", (1920, 1080)), Some(Area { x: 920, y: 280, w: 1000, h: 800 }));
     }
 }

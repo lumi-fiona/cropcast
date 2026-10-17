@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 
     // cropcast's own path, back to an arbitrary size.
     print!("\n== Display::update_mode(2382, 1310): ");
-    let own = d.update_mode(2382, 1310);
+    let own = d.update_mode(2382, 1310, POINT { x: d.rect.left, y: d.rect.top });
     match &own {
         Ok(()) => println!("ok, at {:?}", d.rect),
         Err(e) => println!("FAILED: {}", e.message()),
