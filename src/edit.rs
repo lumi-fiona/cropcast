@@ -13,7 +13,7 @@ use crate::virtual_monitor::real_monitor;
 /// How far into the Area an edge or corner can be grabbed, in px.
 pub const EDGE: i32 = 12;
 /// The smallest Area side, in px (even).
-const MIN: i32 = 360;
+pub const MIN: i32 = 360;
 /// A resize lands on a snap ratio when the dragged side is this close to it, in px. A dial to tune.
 const SNAP_PX: i32 = 24;
 /// (21, 9) is true 21:9 (3360×1440); (43, 18) would land on the 3440×1440 ultrawide instead.
