@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod driver;
 mod mirror;
 mod virtual_monitor;
 mod vda;
@@ -12,8 +13,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
@@ -29,6 +30,7 @@ const ID_AUTOSTART: u32 = 2;
 const ID_RESET_AREA: u32 = 3;
 const ID_SHOW_BORDER: u32 = 4;
 const ID_QUIT: u32 = 5;
+const ID_REMOVE_DRIVER: u32 = 6;
 
 thread_local! {
     /// Some while the Virtual monitor is on. Only the UI thread touches it, and never across a call that
@@ -41,6 +43,9 @@ static AUTOSTART: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 fn main() -> Result<()> {
+    if let Some(code) = driver::run_flag() {
+        std::process::exit(code);
+    }
     unsafe {
         // Physical pixels everywhere: the Area, the Virtual monitor and the presenter must match 1:1.
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
@@ -101,11 +106,11 @@ unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
     unsafe { Shell_NotifyIconW(NIM_ADD, &nid).ok() }
 }
 
-/// An error balloon from the tray icon, for things Lumi has to know about.
-fn notify_error(hwnd: HWND, title: &str, text: &str) {
+/// A balloon from the tray icon, for things Lumi has to know about.
+fn notify(hwnd: HWND, icon: NOTIFY_ICON_INFOTIP_FLAGS, title: &str, text: &str) {
     let mut nid = tray_icon(hwnd);
     nid.uFlags = NIF_INFO;
-    nid.dwInfoFlags = NIIF_ERROR;
+    nid.dwInfoFlags = icon;
     let copy = |dst: &mut [u16], s: &str| {
         let src: Vec<u16> = s.encode_utf16().take(dst.len() - 1).collect();
         dst[..src.len()].copy_from_slice(&src);
@@ -122,12 +127,18 @@ fn monitor_on() -> bool {
 }
 
 fn start_monitor(hwnd: HWND) {
+    if driver::needed()
+        && let Err(e) = driver::install()
+    {
+        notify(hwnd, NIIF_ERROR, "The Virtual monitor stays off", &e.message());
+        return;
+    }
     let r = virtual_monitor::real_monitor();
     let area = Area::default_for((r.right - r.left) as u32, (r.bottom - r.top) as u32);
     // Outside the borrow: adding the monitor re-enters wndproc.
     match VirtualMonitor::start(area) {
         Ok(s) => VIRTUAL_MONITOR.set(Some(s)),
-        Err(e) => notify_error(hwnd, "The Virtual monitor couldn't start", &e.message()),
+        Err(e) => notify(hwnd, NIIF_ERROR, "The Virtual monitor couldn't start", &e.message()),
     }
 }
 
@@ -150,6 +161,7 @@ unsafe fn show_menu(hwnd: HWND) -> Result<()> {
         AppendMenuW(menu, MF_STRING, ID_RESET_AREA as usize, w!("&Reset Area to 2560×1440 center"))?;
         AppendMenuW(menu, MF_STRING, ID_SHOW_BORDER as usize, w!("Show &Border briefly"))?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        AppendMenuW(menu, MF_STRING, ID_REMOVE_DRIVER as usize, w!("Remove &driver…"))?;
         AppendMenuW(menu, MF_STRING, ID_QUIT as usize, w!("&Quit"))?;
 
         let mut cursor = POINT::default();
@@ -173,6 +185,13 @@ unsafe fn show_menu(hwnd: HWND) -> Result<()> {
             ID_VIRTUAL_MONITOR => start_monitor(hwnd),
             ID_AUTOSTART => _ = AUTOSTART.fetch_xor(true, Ordering::Relaxed),
             ID_RESET_AREA | ID_SHOW_BORDER => {}
+            ID_REMOVE_DRIVER => {
+                stop_monitor();
+                match driver::uninstall() {
+                    Ok(()) => notify(hwnd, NIIF_INFO, "Driver removed", "Turning the Virtual monitor on installs it again."),
+                    Err(e) => notify(hwnd, NIIF_ERROR, "The Driver is still installed", &e.message()),
+                }
+            }
             ID_QUIT => {
                 stop_monitor();
                 let _ = Shell_NotifyIconW(NIM_DELETE, &tray_icon(hwnd));
@@ -204,7 +223,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(e) = failed {
                     // A dead capture would freeze the stream; better off and said so.
                     stop_monitor();
-                    notify_error(hwnd, "The Virtual monitor stopped", &e.message());
+                    notify(hwnd, NIIF_ERROR, "The Virtual monitor stopped", &e.message());
                 }
                 LRESULT(0)
             }
