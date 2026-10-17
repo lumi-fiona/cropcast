@@ -1,10 +1,12 @@
 #![windows_subsystem = "windows"]
 
+mod border;
+mod edit;
 mod mirror;
 mod virtual_monitor;
 mod vda;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -30,10 +32,19 @@ const ID_RESET_AREA: u32 = 3;
 const ID_SHOW_BORDER: u32 = 4;
 const ID_QUIT: u32 = 5;
 
+const ID_POLL: usize = 1;
+/// Hotkey poll interval, and the faster one while Edit mode follows the mouse.
+const POLL_IDLE_MS: u32 = 50;
+const POLL_EDIT_MS: u32 = 15; // one 15.6 ms system tick, about 60 Hz
+
 thread_local! {
     /// Some while the Virtual monitor is on. Only the UI thread touches it, and never across a call that
     /// can re-enter the window procedure (adding a monitor sends WM_DISPLAYCHANGE).
     static VIRTUAL_MONITOR: RefCell<Option<VirtualMonitor>> = const { RefCell::new(None) };
+    /// The Area, kept while the Virtual monitor is off too. Edit mode changes it on release.
+    static AREA: Cell<Area> = Cell::new(default_area());
+    /// Some while Edit mode is on.
+    static EDIT: RefCell<Option<edit::Session>> = const { RefCell::new(None) };
 }
 static RECAPTURE_POSTED: AtomicBool = AtomicBool::new(false);
 // ponytail: menu state only, the tray extras slice wires it to real behaviour.
@@ -72,6 +83,7 @@ fn main() -> Result<()> {
             None,
         )?;
         add_tray_icon(hwnd)?;
+        SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -121,11 +133,14 @@ fn monitor_on() -> bool {
     VIRTUAL_MONITOR.with_borrow(|s| s.is_some())
 }
 
-fn start_monitor(hwnd: HWND) {
+fn default_area() -> Area {
     let r = virtual_monitor::real_monitor();
-    let area = Area::default_for((r.right - r.left) as u32, (r.bottom - r.top) as u32);
+    Area::default_for((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+}
+
+fn start_monitor(hwnd: HWND) {
     // Outside the borrow: adding the monitor re-enters wndproc.
-    match VirtualMonitor::start(area) {
+    match VirtualMonitor::start(AREA.get()) {
         Ok(s) => VIRTUAL_MONITOR.set(Some(s)),
         Err(e) => notify_error(hwnd, "The Virtual monitor couldn't start", &e.message()),
     }
@@ -135,6 +150,32 @@ fn stop_monitor() {
     // Take first, drop after: removing the monitor re-enters wndproc too.
     let s = VIRTUAL_MONITOR.take();
     drop(s);
+}
+
+/// Enters, drives and leaves Edit mode from the hotkey poll.
+fn tick(hwnd: HWND) {
+    let held = edit::hotkey_held();
+    let editing = EDIT.with_borrow(|e| e.is_some());
+    if held && !editing {
+        // ponytail: a Border that can't be made means no Edit mode; the next tick tries again.
+        let Ok(s) = edit::Session::begin(AREA.get()) else { return };
+        EDIT.set(Some(s));
+        unsafe { SetTimer(Some(hwnd), ID_POLL, POLL_EDIT_MS, None) };
+    } else if held {
+        // A move is live; a new size waits for the release.
+        if let Some(area) = EDIT.with_borrow_mut(|e| e.as_mut().and_then(|s| s.update())) {
+            VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().map(|v| v.set_area(area)));
+        }
+    } else if let Some(s) = EDIT.take() {
+        AREA.set(s.area);
+        drop(s); // hides the Border
+        // A resize: remove and re-add the Virtual monitor at the new size, which restarts WGC too.
+        if !VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_none_or(|v| v.set_area(AREA.get()))) {
+            stop_monitor();
+            start_monitor(hwnd);
+        }
+        unsafe { SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None) };
+    }
 }
 
 unsafe fn show_menu(hwnd: HWND) -> Result<()> {
@@ -206,6 +247,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     stop_monitor();
                     notify_error(hwnd, "The Virtual monitor stopped", &e.message());
                 }
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                tick(hwnd);
                 LRESULT(0)
             }
             WM_ENDSESSION if wparam.0 != 0 => {

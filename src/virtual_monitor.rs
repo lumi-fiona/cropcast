@@ -34,6 +34,17 @@ impl VirtualMonitor {
         Ok(vm)
     }
 
+    /// Points the copy box at `area` if it has the Virtual monitor's size (a live move); false if
+    /// it needs a new monitor.
+    pub fn set_area(&self, area: Area) -> bool {
+        let mut m = self.mirror.lock().unwrap();
+        let fits = (m.area.w, m.area.h) == (area.w, area.h);
+        if fits {
+            m.area = area;
+        }
+        fits
+    }
+
     /// Any monitor add, remove or mode change kills the WGC capture of the real monitor and
     /// its HMONITOR, so start a fresh one.
     pub fn recapture(&mut self) -> Result<()> {
