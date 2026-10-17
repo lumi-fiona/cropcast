@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main, worktree-agent-a71b7bc15b82bc2fa]
+    branches: [main]
     tags: ["v*"]
   pull_request:
 
