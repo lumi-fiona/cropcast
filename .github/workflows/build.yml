@@ -42,7 +42,8 @@ jobs:
           persist-credentials: false
       - run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find MSBuild\**\Bin\MSBuild.exe
+          # 64-bit MSBuild: the x86 one can't load the WDK's x86\InfVerif.dll on this image.
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find MSBuild\**\Bin\amd64\MSBuild.exe
           & $msbuild "sudovda\Virtual Display Driver (HDR)\SudoVDA.sln" /m /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off
           $out = "sudovda\Virtual Display Driver (HDR)\x64\Release\SudoVDA"
           New-Item -ItemType Directory driver | Out-Null
