@@ -55,6 +55,14 @@ impl Border {
         }
     }
 
+    /// Lets the mouse through, for a Border that's only shown, not edited.
+    pub fn pass_clicks(&self) {
+        unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as isize);
+        }
+    }
+
     /// Puts the Border over `a`. The real monitor is primary, so Area pixels are desktop pixels.
     pub fn show(&mut self, a: Area) -> Result<()> {
         let size = (a.w as i32, a.h as i32);

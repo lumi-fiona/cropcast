@@ -1,16 +1,19 @@
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod border;
 mod edit;
 mod mirror;
+mod settings;
 mod virtual_monitor;
 mod vda;
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{
@@ -25,6 +28,8 @@ use virtual_monitor::VirtualMonitor;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_RECAPTURE: u32 = WM_APP + 2;
+/// From a second launch: show the Border briefly, as a "here I am".
+const WM_HELLO: u32 = WM_APP + 3;
 
 const ID_VIRTUAL_MONITOR: u32 = 1;
 const ID_AUTOSTART: u32 = 2;
@@ -36,23 +41,33 @@ const ID_POLL: usize = 1;
 /// Hotkey poll interval, and the faster one while Edit mode follows the mouse.
 const POLL_IDLE_MS: u32 = 50;
 const POLL_EDIT_MS: u32 = 15; // one 15.6 ms system tick, about 60 Hz
+const ID_FLASH: usize = 2;
+const FLASH_MS: u32 = 1500;
 
 thread_local! {
     /// Some while the Virtual monitor is on. Only the UI thread touches it, and never across a call that
     /// can re-enter the window procedure (adding a monitor sends WM_DISPLAYCHANGE).
     static VIRTUAL_MONITOR: RefCell<Option<VirtualMonitor>> = const { RefCell::new(None) };
     /// The Area, kept while the Virtual monitor is off too. Edit mode changes it on release.
-    static AREA: Cell<Area> = Cell::new(default_area());
+    static AREA: Cell<Area> = Cell::new(settings::load().unwrap_or_else(default_area));
     /// Some while Edit mode is on.
     static EDIT: RefCell<Option<edit::Session>> = const { RefCell::new(None) };
+    /// Some while Show Border briefly shows it.
+    static FLASH: RefCell<Option<border::Border>> = const { RefCell::new(None) };
 }
 static RECAPTURE_POSTED: AtomicBool = AtomicBool::new(false);
-// ponytail: menu state only, the tray extras slice wires it to real behaviour.
-static AUTOSTART: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 fn main() -> Result<()> {
     unsafe {
+        // One cropcast per session. The handle lives as long as the process.
+        let _single = CreateMutexW(None, false, w!(r"Local\cropcast"))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Ok(first) = FindWindowW(w!("cropcast"), w!("cropcast")) {
+                let _ = PostMessageW(Some(first), WM_HELLO, WPARAM(0), LPARAM(0));
+            }
+            return Ok(());
+        }
         // Physical pixels everywhere: the Area, the Virtual monitor and the presenter must match 1:1.
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
         RoInitialize(RO_INIT_MULTITHREADED)?;
@@ -159,6 +174,7 @@ fn tick(hwnd: HWND) {
     if held && !editing {
         // ponytail: a Border that can't be made means no Edit mode; the next tick tries again.
         let Ok(s) = edit::Session::begin(AREA.get()) else { return };
+        drop(FLASH.take());
         EDIT.set(Some(s));
         unsafe { SetTimer(Some(hwnd), ID_POLL, POLL_EDIT_MS, None) };
     } else if held {
@@ -167,34 +183,59 @@ fn tick(hwnd: HWND) {
             VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().map(|v| v.set_area(area)));
         }
     } else if let Some(s) = EDIT.take() {
+        let changed = s.area != AREA.get();
         AREA.set(s.area);
         drop(s); // hides the Border
-        // A resize: remove and re-add the Virtual monitor at the new size, which restarts WGC too.
-        if !VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_none_or(|v| v.set_area(AREA.get()))) {
-            // Out of the cell while resizing: re-adding the monitor re-enters wndproc.
-            if let Some(mut v) = VIRTUAL_MONITOR.take() {
-                match v.resize(AREA.get()) {
-                    Ok(()) => VIRTUAL_MONITOR.set(Some(v)),
-                    Err(e) => {
-                        drop(v);
-                        notify_error(hwnd, "The Virtual monitor stopped", &e.message());
-                    }
+        if changed {
+            save_area(hwnd);
+        }
+        apply_area(hwnd);
+        unsafe { SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None) };
+    }
+}
+
+/// Puts the Virtual monitor, if on, on the Area. A resize removes and re-adds it at the new size,
+/// which restarts WGC too.
+fn apply_area(hwnd: HWND) {
+    if !VIRTUAL_MONITOR.with_borrow(|v| v.as_ref().is_none_or(|v| v.set_area(AREA.get()))) {
+        // Out of the cell while resizing: re-adding the monitor re-enters wndproc.
+        if let Some(mut v) = VIRTUAL_MONITOR.take() {
+            match v.resize(AREA.get()) {
+                Ok(()) => VIRTUAL_MONITOR.set(Some(v)),
+                Err(e) => {
+                    drop(v);
+                    notify_error(hwnd, "The Virtual monitor stopped", &e.message());
                 }
             }
         }
-        unsafe { SetTimer(Some(hwnd), ID_POLL, POLL_IDLE_MS, None) };
+    }
+}
+
+fn save_area(hwnd: HWND) {
+    if let Err(e) = settings::save(AREA.get()) {
+        notify_error(hwnd, "The Area couldn't be saved", &e.to_string());
+    }
+}
+
+/// The Border for FLASH_MS, click-through, outside Edit mode (which shows its own).
+fn show_border_briefly(hwnd: HWND) {
+    if EDIT.with_borrow(|e| e.is_some()) {
+        return;
+    }
+    let Ok(mut b) = border::Border::new() else { return };
+    b.pass_clicks();
+    if b.show(AREA.get()).is_ok() {
+        drop(FLASH.replace(Some(b)));
+        unsafe { SetTimer(Some(hwnd), ID_FLASH, FLASH_MS, None) };
     }
 }
 
 unsafe fn show_menu(hwnd: HWND) -> Result<()> {
     unsafe {
         let menu = CreatePopupMenu()?;
-        let checked = |on: &AtomicBool| {
-            if on.load(Ordering::Relaxed) { MF_CHECKED } else { MF_UNCHECKED }
-        };
-        let on = if monitor_on() { MF_CHECKED } else { MF_UNCHECKED };
-        AppendMenuW(menu, MF_STRING | on, ID_VIRTUAL_MONITOR as usize, w!("&Virtual monitor"))?;
-        AppendMenuW(menu, MF_STRING | checked(&AUTOSTART), ID_AUTOSTART as usize, w!("Start with &Windows"))?;
+        let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
+        AppendMenuW(menu, MF_STRING | checked(monitor_on()), ID_VIRTUAL_MONITOR as usize, w!("&Virtual monitor"))?;
+        AppendMenuW(menu, MF_STRING | checked(autostart::enabled()), ID_AUTOSTART as usize, w!("Start with &Windows"))?;
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
         AppendMenuW(menu, MF_STRING, ID_RESET_AREA as usize, w!("&Reset Area to 2560×1440 center"))?;
         AppendMenuW(menu, MF_STRING, ID_SHOW_BORDER as usize, w!("Show &Border briefly"))?;
@@ -220,8 +261,18 @@ unsafe fn show_menu(hwnd: HWND) -> Result<()> {
         match id {
             ID_VIRTUAL_MONITOR if monitor_on() => stop_monitor(),
             ID_VIRTUAL_MONITOR => start_monitor(hwnd),
-            ID_AUTOSTART => _ = AUTOSTART.fetch_xor(true, Ordering::Relaxed),
-            ID_RESET_AREA | ID_SHOW_BORDER => {}
+            ID_AUTOSTART => {
+                if let Err(e) = autostart::set(!autostart::enabled()) {
+                    notify_error(hwnd, "Start with Windows couldn't be changed", &e.message());
+                }
+            }
+            ID_RESET_AREA => {
+                AREA.set(default_area());
+                save_area(hwnd);
+                apply_area(hwnd);
+                show_border_briefly(hwnd);
+            }
+            ID_SHOW_BORDER => show_border_briefly(hwnd),
             ID_QUIT => {
                 stop_monitor();
                 let _ = Shell_NotifyIconW(NIM_DELETE, &tray_icon(hwnd));
@@ -257,8 +308,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == ID_FLASH => {
+                let _ = KillTimer(Some(hwnd), ID_FLASH);
+                drop(FLASH.take());
+                LRESULT(0)
+            }
             WM_TIMER => {
                 tick(hwnd);
+                LRESULT(0)
+            }
+            WM_HELLO => {
+                show_border_briefly(hwnd);
                 LRESULT(0)
             }
             WM_ENDSESSION if wparam.0 != 0 => {
