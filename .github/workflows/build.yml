@@ -51,22 +51,13 @@ jobs:
           New-Item -ItemType Directory driver | Out-Null
           Copy-Item "$out\SudoVDA.inf", "$out\SudoVDA.dll", "$out\sudovda.cat" driver
           Get-ChildItem driver
-      - name: TEMP throwaway test PFX
-        run: |
-          $c = New-SelfSignedCertificate -Subject 'CN=cropcast driver TEST' -Type CodeSigningCert -KeyExportPolicy Exportable -CertStoreLocation Cert:\CurrentUser\My
-          $pw = [guid]::NewGuid().ToString()
-          Export-PfxCertificate -Cert $c -FilePath t.pfx -Password (ConvertTo-SecureString $pw -AsPlainText -Force) -CryptoAlgorithmOption AES256_SHA256 | Out-Null
-          Remove-Item "Cert:\CurrentUser\My\$($c.Thumbprint)" -DeleteKey
-          "TEST_PFX_BASE64=$([Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\t.pfx")))" >> $env:GITHUB_ENV
-          "TEST_PFX_PASSWORD=$pw" >> $env:GITHUB_ENV
-          Remove-Item t.pfx
       # Secrets only on pushes to this repo; forks and PRs get an unsigned package.
       - name: Sign the catalog
         id: sign
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && env.HAVE_PFX == 'true'
         env:
-          PFX_BASE64: ${{ env.TEST_PFX_BASE64 }}
-          PFX_PASSWORD: ${{ env.TEST_PFX_PASSWORD }}
+          PFX_BASE64: ${{ secrets.DRIVER_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.DRIVER_PFX_PASSWORD }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $pfx = "$env:RUNNER_TEMP\driver.pfx"
