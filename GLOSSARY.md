@@ -5,7 +5,7 @@ The rectangle of the real screen that viewers see. Freely shaped but always an e
 _Avoid_: region, crop, zone
 
 **Border**
-The outline drawn around the Area so its owner can see what viewers see. Never visible to viewers.
+The outline drawn around the Area, with the rest of the screen shaded, so its owner can see what viewers see. Never visible to viewers.
 _Avoid_: overlay, frame, highlight
 
 **Edit mode**
