@@ -40,12 +40,13 @@ jobs:
     outputs:
       signed: ${{ steps.sign.outcome == 'success' }}
     env:
-      SUDOVDA_COMMIT: a4b09fa2aa731a964d0cb5d139cb1e6240e4da12
+      # cropcast's fork, branch cropcast-update-mode: adds IOCTL_UPDATE_MODE, protocol 0.3.0.
+      SUDOVDA_COMMIT: 7a50e059f8edbacc0363a2b03665254ed6f987ff
       HAVE_PFX: ${{ secrets.DRIVER_PFX_BASE64 != '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          repository: SudoMaker/SudoVDA
+          repository: lumi-fiona/SudoVDA
           ref: ${{ env.SUDOVDA_COMMIT }}
           path: sudovda
           persist-credentials: false

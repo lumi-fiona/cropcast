@@ -35,21 +35,25 @@ impl VirtualMonitor {
         Ok(vm)
     }
 
-    /// Re-adds the Virtual monitor at `area`'s size, keeping the presenter, device and swapchain
-    /// so the gap stays short (~0.5 s in the spike). A longer gap ends Discord's share.
+    /// Changes the Virtual monitor's mode to `area`'s size in place, so Discord keeps sharing it,
+    /// keeping the presenter, device and swapchain.
     pub fn resize(&mut self, area: Area) -> Result<()> {
         self.capture = None;
-        self.mirror.lock().unwrap().presenting = false;
-        unsafe {
-            // Hide before the monitor goes, or Windows moves the window onto the real screen.
-            let _ = ShowWindow(self.presenter.0, SW_HIDE);
+        if !self.display.as_mut().is_some_and(|d| d.update_mode(area.w, area.h).is_ok()) {
+            // ponytail: Windows may refuse a size it didn't list when the monitor arrived. Then this
+            // re-adds the monitor at the new size, which pauses Discord's share. Delete once
+            // examples/mode_probe.rs shows arbitrary sizes work live.
+            self.mirror.lock().unwrap().presenting = false;
+            unsafe {
+                // Hide before the monitor goes, or Windows moves the window onto the real screen.
+                let _ = ShowWindow(self.presenter.0, SW_HIDE);
+            }
+            self.display = None;
+            let real = real_monitor();
+            self.display = Some(Display::add(area.w, area.h, POINT { x: real.right, y: real.bottom })?);
         }
-        self.display = None;
         self.mirror.lock().unwrap().resize(area)?;
-        let real = real_monitor();
-        let display = Display::add(area.w, area.h, POINT { x: real.right, y: real.bottom })?;
-        let r = display.rect;
-        self.display = Some(display);
+        let r = self.display.as_ref().unwrap().rect;
         unsafe {
             SetWindowPos(
                 self.presenter.0,
@@ -66,7 +70,7 @@ impl VirtualMonitor {
     }
 
     /// Points the copy box at `area` if it has the Virtual monitor's size (a live move); false if
-    /// it needs a new monitor.
+    /// it needs a `resize`.
     pub fn set_area(&self, area: Area) -> bool {
         let mut m = self.mirror.lock().unwrap();
         let fits = (m.area.w, m.area.h) == (area.w, area.h);
